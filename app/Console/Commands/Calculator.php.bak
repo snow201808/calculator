@@ -1,0 +1,295 @@
+<?php
+declare(strict_types=1);
+
+namespace App\Console\Commands;
+
+use Illuminate\Console\Command;
+use mysql_xdevapi\Exception;
+use function Laravel\Prompts\text;
+use function Laravel\Prompts\info;
+use function Laravel\Prompts\error;
+
+class Calculator extends Command
+{
+    /**
+     * The name and signature of the console command.
+     *
+     * @var string
+     */
+    protected $signature = 'calculator {--M|model=common : Choose the calculation method, with options [ simple ] or [ common ]}';
+
+    /**
+     * The console command description.
+     *
+     * @var string
+     */
+    protected $description = 'calculator';
+
+    protected string $model;
+    protected array $operateTree;
+    protected string $expression;
+
+    protected string $tagLeft = '(';
+    protected string $tagRight = ')';
+    protected string $operateAdd = '+';
+    protected string $operateReduce = '-';
+    protected string $operateRide = '*';
+    protected string $operateDivision = '/';
+    protected string $operateComplementation = '%';
+    protected array $priorityList;
+    protected array $commonList;
+
+    /**
+     * Execute the console command.
+     */
+    public function handle()
+    {
+        $this->model = $this->option("model");
+        $this->init();
+    }
+
+    /**
+     * init
+     */
+    public function init()
+    {
+        $this->waitInput();
+        $this->calculator();
+    }
+
+    /**
+     * Waiting for user input
+     */
+    public function waitInput()
+    {
+        // user input
+        $expression = text(
+            label: "Please enter the calculation expression",
+            placeholder: "E.g. 1+1",
+            required: true
+        );
+        // remove spaces
+        $this->expression = str_replace(" ","", $expression);
+        // check user input
+        if (!$this->checkInput()) {
+            $this->waitInput();
+        }
+    }
+
+    /**
+     * check user input
+     */
+    public function checkInput() : bool
+    {
+        $pattern = '/[^\d\.\+\-\*\/\%\(\)]/';
+        preg_match($pattern, $this->expression, $match);
+        if (empty($match)) {
+            return true;
+        }
+        error("Contains illegal characters '".implode(",", $match)."', Only integers, decimals,+- */%, and () can be entered");
+        return false;
+    }
+
+    /**
+     * calculator
+     */
+    public function calculator()
+    {
+        switch ($this->model)
+        {
+            case 'simple':
+                $result = eval("return $this->expression;");
+                break;
+            case 'common':
+                $result = $this->commonCalculator();
+                break;
+            default:
+                break;
+        }
+        info("The calculation result is $result");
+        $this->init();
+    }
+
+    /**
+     * common Calculator
+     */
+    public function commonCalculator()
+    {
+        $tree = $this->getParseTree();
+        if (!empty($tree['priority'])) {
+            $this->priorityList = $tree['priority'];
+            unset($tree['priority']);
+        }
+        // 解析主树
+        $this->commonList = $this->parseTree($tree);
+        foreach ($this->priorityList as $k => $v) {
+            $this->priorityList[$k] = $this->parseTree($v);
+        }
+        return $this->calculatorTree();
+    }
+
+    /**
+     * parse str input tree
+     */
+    public function getParseTree() : array
+    {
+        // check is in ()
+        $deep = 0;
+        // deepNum
+        $deepSeat = 0;
+        $expressionList = str_split($this->expression);
+        // operation tree
+        $tree = [];
+        // with ()
+        $mustInDeep = false;
+        // determine after TagLeft
+        $isAfterTagLeft = false;
+        for ($i = 0; $i < count($expressionList); $i++) {
+            // if start with )+-*/% ,ignore
+            if ($i == 0 && !is_numeric($expressionList[$i]) && ($expressionList[$i] != $this->tagLeft)) {
+                continue;
+            }
+            // after (, operators cannot be used
+            if ($isAfterTagLeft && in_array($expressionList[$i], [$this->operateAdd,$this->operateReduce,$this->operateRide,$this->operateDivision,$this->operateComplementation])) {
+                continue;
+            }
+            // (
+            if ($expressionList[$i] == $this->tagLeft) {
+                if ($deep != 0) {
+                    $deep++;
+                    $oldSeatName = "seat_".$deepSeat;
+                    $deepSeat++;
+                    $newSeatName = "seat_".$deepSeat;
+                    $tree['priority'][$oldSeatName]['seat_'.$i] = $newSeatName;
+                } else {
+                    $deep++;
+                    $seatName = "seat_".$deepSeat;
+                    $tree['seat_'.$i] = $seatName;
+                    $tree['priority'][$seatName] = [];
+                    $isAfterTagLeft = true;
+                }
+            } else if ($expressionList[$i] == $this->tagRight) {
+                // )
+                $isAfterTagLeft = false;
+                $mustInDeep = false;
+                $deep--;
+            } else if (is_numeric($expressionList[$i])) {
+                $isAfterTagLeft = false;
+                $seatName = "seat_".$deepSeat;
+                // numeric
+                if ($mustInDeep) {
+                    $tree['priority'][$seatName]['num_'.$i] = $expressionList[$i];
+                } else {
+                    $tree['num_'.$i] = $expressionList[$i];
+                }
+            } else if (in_array($expressionList[$i], [$this->operateAdd,$this->operateReduce,$this->operateRide,$this->operateDivision,$this->operateComplementation])) {
+                $isAfterTagLeft = false;
+                $seatName = "seat_".$deepSeat;
+                if ($mustInDeep) {
+                    $tree['priority'][$seatName]['operation_'.$i] = $expressionList[$i];
+                } else {
+                    $tree['operation_'.$i] = $expressionList[$i];
+                }
+            }
+            if ($deep != 0) {
+                $mustInDeep = true;
+            }
+        }
+        return $tree;
+    }
+
+    /**
+     * parse tree
+     */
+    public function parseTree($tree)
+    {
+        $highPriority = [];
+        $usedList = [];
+        $loopTree = array_values($tree);
+        // sort tree by operation
+        foreach ($loopTree as $k => $v) {
+            if ($k == 0) {
+                continue;
+            }
+            if (in_array($v, [$this->operateRide,$this->operateDivision,$this->operateComplementation])) {
+                $previousKey = "key_".($k - 1);
+                $currentKey = "key_".$k;
+                $nextKey = "key_".($k + 1);
+                if (!in_array($previousKey, $usedList)) {
+                    $highPriority[] = $loopTree[$k - 1];
+                    $usedList[] = $previousKey;
+                    unset($loopTree[$k - 1]);
+                }
+                if (!in_array($currentKey, $usedList)) {
+                    $highPriority[] = $v;
+                    $usedList[] = $currentKey;
+                    unset($loopTree[$k]);
+                }
+                if (!in_array($nextKey, $usedList)) {
+                    $highPriority[] = $loopTree[$k + 1];
+                    $usedList[] = $nextKey;
+                    unset($loopTree[$k + 1]);
+                }
+            }
+        }
+        // must like ['1', '+']
+        if (count($loopTree) == 2 && is_numeric($loopTree[0])) {
+            $loopTree = array_reverse($loopTree);
+        }
+        return array_merge($highPriority, $loopTree);
+    }
+
+    /**
+     * calculator tree
+     */
+    public function calculatorTree()
+    {
+        foreach ($this->commonList as $k => $v) {
+            if (str_contains($v, 'seat')) {
+                $this->calculatorSeat($v);
+            }
+        }
+    }
+
+    /**
+     * calculator priority
+     */
+    public function calculatorSeat($seat) : int
+    {
+        if (empty($this->priorityList[$seat])) {
+            return 0;
+        }
+        return 0;
+    }
+
+       /**
+         * parse operator to tree
+         */
+        public function parseToOperatorTree($tree) : array
+        {
+            $highPriority = [];
+            $loopTree = array_values($tree);
+            // sort tree by operation
+            foreach ($loopTree as $k => $v) {
+                if (in_array($v, [$this->operateRide,$this->operateDivision,$this->operateComplementation])) {
+                    $previousKey = $k - 1;
+                    $currentKey = $k;
+                    $nextKey = $k + 1;
+                    $preHighPriority = [
+                        $previousKey,
+                        $currentKey,
+                        $nextKey
+                    ];
+                    $highPriority[] = $preHighPriority;
+                }
+            }
+            $newHighPriority = [];
+            if (!empty($highPriority)) {
+                foreach ($highPriority as $value) {
+                    $newHighPriority = array_unique(array_merge($newHighPriority, $value));
+                }
+            }
+            print_r($newHighPriority);
+            return array_merge($highPriority, $loopTree);
+        }
+}
